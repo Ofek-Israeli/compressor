@@ -14,6 +14,23 @@ def load_tokenizer(model_id: str) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(model_id)
 
 
+def get_stop_token_ids(tok: AutoTokenizer) -> List[int]:
+    """
+    Stop token IDs for Target generation (EOS + Llama-3 EOT when present).
+    Matches minions_channel minions/clients/sglang.py stop_ids logic so
+    generation stops at end-of-turn and does not over-decode.
+    """
+    stop_ids: List[int] = []
+    if tok.eos_token_id is not None:
+        stop_ids.append(tok.eos_token_id)
+    eot_id = tok.convert_tokens_to_ids("<|eot_id|>")
+    if eot_id is not None and eot_id != getattr(tok, "unk_token_id", None):
+        stop_ids.append(eot_id)
+    if not stop_ids:
+        stop_ids = [128001, 128009]  # Llama-3 EOS and EOT fallback
+    return stop_ids
+
+
 def tokenize(tok: AutoTokenizer, text: str) -> List[int]:
     return tok.encode(text, add_special_tokens=False)
 
@@ -68,7 +85,7 @@ def compute_freq_and_delta(
 ) -> Tuple[List[int], Dict[int, float], Dict[int, float], Dict[int, float]]:
     """
     retained_pairs: list of (tokens_verbose, tokens_comp, weight).
-    Returns (top_k_token_ids, delta_by_id, freq_raw, freq_comp).
+    Returns (top_k_token_ids, frequency_difference_by_id, freq_raw, freq_comp).
     """
     C_raw: Dict[int, float] = defaultdict(float)
     Z_raw = 0.0
@@ -96,10 +113,11 @@ def build_v_steer_and_delta_by_id(
     top_ids: List[int],
     delta: Dict[int, float],
 ) -> Tuple[List[dict], List[int], Dict[str, float]]:
+    """Build v_steer list and frequency_difference_by_token_id from top_ids and frequency-difference map."""
     v_steer = [
-        {"token_id": t, "token_str": decode_one(tok, t), "delta": delta[t]}
+        {"token_id": t, "token_str": decode_one(tok, t), "frequency_difference": delta[t]}
         for t in top_ids
     ]
     v_steer_token_ids = top_ids
-    delta_by_token_id = {str(t): delta[t] for t in top_ids}
-    return v_steer, v_steer_token_ids, delta_by_token_id
+    frequency_difference_by_token_id = {str(t): delta[t] for t in top_ids}
+    return v_steer, v_steer_token_ids, frequency_difference_by_token_id

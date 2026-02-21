@@ -1,5 +1,5 @@
 """
-Load and validate kconfig (YAML). No defaults, no fallbacks.
+Load and validate kconfig (YAML or Kconfig .config). No defaults, no fallbacks.
 Any missing or null key terminates the program.
 See docs/phase0.md §3 and §4.1.
 """
@@ -41,7 +41,6 @@ REQUIRED_KEYS: List[str] = [
     "reflector.top_p",
     "reflector.max_new_tokens",
     "reflector.seed",
-    "reflector.compress_prompt_template",
     "reflector.api_base",
     "reflector.api_key_env",
     "data.financebench_path",
@@ -82,14 +81,22 @@ def _is_empty(v: Any) -> bool:
 
 
 def load_and_validate(kconfig_path: str) -> Dict[str, Any]:
-    """Load YAML and validate every required key; raise ValueError on any missing/null."""
+    """Load config (YAML or Kconfig .config) and validate every required key; raise ValueError on any missing/null."""
     path = Path(kconfig_path)
     if not path.exists():
         raise ValueError(f"kconfig not found: {kconfig_path}")
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f)
+    if path.suffix == ".config" or path.name == ".config":
+        # kconfig_loader lives at repo root (sibling of compressor package)
+        _repo_root = Path(__file__).resolve().parent.parent.parent
+        if str(_repo_root) not in __import__("sys").path:
+            __import__("sys").path.insert(0, str(_repo_root))
+        from kconfig_loader import load_config as load_kconfig
+        cfg = load_kconfig(str(path))
+    else:
+        with open(path, "r") as f:
+            cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
-        raise ValueError("kconfig must be a YAML object (dict)")
+        raise ValueError("kconfig must be a YAML object (dict) or .config")
 
     missing_or_empty: List[str] = []
     for key in REQUIRED_KEYS:

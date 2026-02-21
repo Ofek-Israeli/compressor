@@ -71,7 +71,7 @@ there are no hardcoded model names anywhere.
 | `target.top_p` | float | Nucleus sampling p for Target. |
 | `target.max_new_tokens` | int | Max tokens per Target generation. |
 | `target.seed` | int | Seed for Target sampling. Mandatory; no fallback. |
-| `target.prompt_template` | str | Template to serialize `(c, q)` into the Target model prompt (see §4.1 of the plan). Placeholders: `{context}`, `{query}`. |
+| `target.prompt_template` | str | User-message body template for the Target model. Placeholders: `{context}`, `{query}`. **This is not the full prompt;** the full prompt is produced by rendering a `messages` list through the HuggingFace chat template (see §4.5). Example value: `"Context:\n{context}\n\nQuestion:\n{query}"`. |
 
 ### 3.2 Reflector (parallel config block — OpenAI Chat Completions only)
 
@@ -186,18 +186,105 @@ A dedicated Python module will be implemented (later) for calling the
   - `model_id` (str) — from `target.model_id`.
   - `timeout_s` (float) — from `target.sglang.timeout_s`.
   - `max_retries` (int) — from `target.sglang.max_retries`.
-- **Method:** `generate(prompt: str, temperature: float, top_p: float, max_new_tokens: int, seed: int) -> str`
+- **Method:** `generate(prompt: str, temperature: float, top_p: float, max_new_tokens: int, seed: int, stop_token_ids: list[int]) -> str`
   - `seed`: always use `target.seed` from kconfig (mandatory; no fallback).
-  - Sends the request to the local SGLang server via the **single-prompt endpoint** (one prompt string; no chat/messages wrapper) and returns the generated text only.
+  - `stop_token_ids`: list of token ids at which generation must stop (see §4.4b).
+  - Sends the request to the local SGLang server via the **single-prompt endpoint** (one pre-rendered prompt string; no chat/messages wrapper) and returns the generated text only.
 - **Usage:** `collect_data_financebench.py` calls the Target **only** via `SGLangClient.generate(...)`; there are no direct HTTP calls or OpenAI client calls for the Target in the data-collection script.
 
 (This section describes the module and its interface; no code is implemented in this plan.)
+
+### 4.4b Target prompt construction and EOT stopping
+
+The Target model is `meta-llama/Llama-3.1-8B-Instruct` and **must** be
+prompted using its HuggingFace chat template. The raw
+`target.prompt_template` value is only the **user-message body**; the
+full prompt is always produced via `apply_chat_template`.
+
+**Prompt construction:**
+
+```python
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained(target.model_id)
+
+# 1. Build the messages list
+user_body = target.prompt_template.format(context=c, query=q)
+messages = [
+    {"role": "system", "content": "Answer the question using the provided context."},
+    {"role": "user",   "content": user_body},
+]
+
+# 2. Render the full prompt string via the chat template
+prompt_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+```
+
+`prompt_text` is the string sent to `SGLangClient.generate(prompt=prompt_text, ...)`.
+
+**EOT (end-of-turn) stopping:**
+
+We must stop Target generation at the model's end-of-turn token to
+prevent runaway continuation (repetition loops). Obtain the stop token
+id from the same tokenizer:
+
+```python
+EOT_ID = tok.eos_token_id
+```
+
+(For Llama-3.1-Instruct, `tok.eos_token_id` is the end-of-turn token.
+If the tokenizer exposes a dedicated EOT token id different from
+`eos_token_id`, use that id instead.)
+
+Pass `stop_token_ids=[EOT_ID]` in **every** Target generation request:
+
+```python
+text = sglang.generate(
+    prompt=prompt_text,
+    ...,
+    stop_token_ids=[EOT_ID],
+)
+```
+
+This ensures the Target stops cleanly after producing its answer.
 
 ### 4.5 Generate Target verbose answers (plan Step 1)
 
 **Runs only on the train split.**
 
-**Target generation is never executed via OpenAI; it is always executed via the local SGLang server.** Load Target from kconfig (target.\*). For each `(c, q)` in the train split, call **SGLangClient.generate(prompt, temperature=target.temperature, top_p=target.top_p, max_new_tokens=target.max_new_tokens, seed=target.seed)** M_verbose times per (c,q). Use `target.prompt_template.format(context=c, query=q)` for `prompt`. Store each returned string in `verbose_answers: List[str]` per example. The Reflector is **not** called in this step. Enforce max in-flight Target requests using **phase0.target_concurrency** from kconfig (mandatory; no default).
+**Target generation is never executed via OpenAI; it is always executed
+via the local SGLang server.** Load Target from kconfig (target.\*).
+
+1. Load the Target tokenizer once:
+   `tok = AutoTokenizer.from_pretrained(target.model_id)`
+2. Obtain the EOT stop token id:
+   `EOT_ID = tok.eos_token_id`
+3. For each `(c, q)` in the train split, construct the prompt via the
+   chat template (see §4.4b):
+
+   ```python
+   user_body = target.prompt_template.format(context=c, query=q)
+   messages = [
+       {"role": "system", "content": "Answer the question using the provided context."},
+       {"role": "user",   "content": user_body},
+   ]
+   prompt_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+   ```
+
+4. Call **SGLangClient.generate(prompt=prompt_text,
+   temperature=target.temperature, top_p=target.top_p,
+   max_new_tokens=target.max_new_tokens, seed=target.seed,
+   stop_token_ids=[EOT_ID])** M_verbose times per (c,q).
+5. Store each returned string in `verbose_answers: List[str]` per example.
+
+The Reflector is **not** called in this step.
+Enforce max in-flight Target requests using
+**phase0.target_concurrency** from kconfig (mandatory; no default).
+
+> **Note:** `target.prompt_template` is only the user-message body
+> (e.g. `"Context:\n{context}\n\nQuestion:\n{query}"`). The full prompt
+> sent to SGLang is always the output of `apply_chat_template`, which
+> wraps it in the model's expected header/footer tokens. Do not send the
+> raw template directly to the Target model.
 
 ### 4.6 Reflector compression (plan Step 2)
 
@@ -601,8 +688,9 @@ the evidence appears. When constructing the context:
 2. Deduplicate by `(evidence_doc_name, evidence_page_num)`.
 3. Concatenate the unique `evidence_text_full_page` strings separated by
    `"\n\n"`.
-4. Use this concatenated text as the `{context}` placeholder in
-   `target.prompt_template`.
+4. Use this concatenated text as the `{context}` placeholder in the
+   user-message body template (`target.prompt_template`). The full
+   Target prompt is then produced via `apply_chat_template` (see §4.4b).
 
 ### Dataset size
 
@@ -636,21 +724,17 @@ output_dir: "./outputs/phase0"
 log_level: "INFO"
 
 target:
-  model_id: "meta-llama/Meta-Llama-3-8B-Instruct"
+  model_id: "meta-llama/Llama-3.1-8B-Instruct"
   sglang:
-    base_url: "http://localhost:30000"
+    base_url: "http://localhost:8000"
     timeout_s: 120.0
     max_retries: 3
   temperature: 0.7
   top_p: 0.95
   max_new_tokens: 512
   seed: 42
-  prompt_template: |
-    Context:
-    {context}
-    Question:
-    {query}
-    Answer:
+  # User-message body only; full prompt is rendered via apply_chat_template (see §4.4b)
+  prompt_template: "Context:\n{context}\n\nQuestion:\n{query}"
 
 reflector:
   model_id: "gpt-4o"   # from kconfig

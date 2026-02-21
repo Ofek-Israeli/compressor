@@ -32,11 +32,19 @@ Let $V$ be the target model vocabulary and $\texttt{tok}(\cdot)$ be the target m
 Given a generated answer $\hat a$, let $\mathrm{Len}(\hat a)$ be its output length (tokens), and $\mathrm{Err}(\hat a,a^*)$ be an error metric (e.g., exact match / $1-\mathrm{F1}$).
 
 Phase~0 selects $k$ ``fluff'' tokens $V_{\text{steer}}\subset V$.
-We learn one steering magnitude per selected token, plus a dedicated EOS magnitude:
+We learn one steering magnitude per selected token, plus dedicated EOS
+and EOT magnitudes:
 \[
-\boldsymbol{\delta}=(\delta_{v_1},\dots,\delta_{v_k},\;\delta_{\text{EOS}}),
+\boldsymbol{\delta}=(\delta_{v_1},\dots,\delta_{v_k},\;\delta_{\text{EOS}},\;\delta_{\text{EOT}}),
 \qquad v_i \in V_{\text{steer}}.
 \]
+$\mathrm{EOS\_ID} := \texttt{tok.eos\_token\_id}$.
+$\mathrm{EOT\_ID}$ is the target tokenizer's end-of-turn token id used
+as \texttt{stop\_token\_ids} during generation (e.g.\ for
+Llama-3-Instruct, the \texttt{<|eot\_id|>} token).
+$\delta_{\text{EOT}}\in\mathbb{R}$ is a free-sign scalar analogous to
+$\delta_{\text{EOS}}$.
+\textbf{Assert} $\mathrm{EOS\_ID} \neq \mathrm{EOT\_ID}$; if they are equal, terminate (otherwise EOS/EOT bias would double-apply).
 
 \section{Phase 0: Token selection via Target verbose answers + Reflector compression}
 
@@ -248,7 +256,7 @@ candidate set $V' \subseteq V$:
     \item remove $t$ if $u \neq \emptyset$ and every character in $u$ is a digit in $\{0,\dots,9\}$.
   \end{itemize}
 \end{itemize}
-The EOS token is always excluded from $V'$ (hence $\text{EOS} \notin V_{\text{steer}}$), even if \texttt{drop\_special\_tokens} is false, so that only the dedicated $\delta_{\text{EOS}}$ applies and biases are not duplicated.
+EOS and EOT are always excluded from $V'$ (hence not in $V_{\text{steer}}$), even if \texttt{drop\_special\_tokens} is false, so their biases are not duplicated.
 Selection is then performed \emph{only} over $V'$:
 \[
 V_{\text{steer}} = \operatorname{Top\text{-}k}_{v\in V'}\;\Delta(v),
@@ -275,16 +283,15 @@ output; we will learn steering deltas for them in Phase~1.
 
 \section{Phase 1: Learn Steering Magnitudes $\delta_v$ for the Selected Tokens}
 \subsection{Learned module: Global Trainable Deltas}
-The learned parameters are $k+1$ raw scalars shared across all examples:
+The learned parameters are $k+2$ raw scalars shared across all examples:
 \[
-z \in \mathbb{R}^{k+1}.
+z \in \mathbb{R}^{k+2}.
 \]
-The final deltas $\boldsymbol{\delta}=(\delta_{v_1},\dots,\delta_{v_k},\;\delta_{\text{EOS}})$
+The final deltas $\boldsymbol{\delta}=(\delta_{v_1},\dots,\delta_{v_k},\;\delta_{\text{EOS}},\;\delta_{\text{EOT}})$
 are obtained from $z$ via a sign-constrained mapping described below.
 
 \paragraph{Sign-constrained delta parameterization.}
-All steering-token deltas are constrained to be \textbf{non-positive}
-(suppression only), while $\delta_{\text{EOS}}$ may take either sign.
+$\delta_{\text{EOS}}$ and $\delta_{\text{EOT}}$ are free-sign; token deltas $\delta_v$ for $v\in V_{\text{steer}}$ remain suppression-only (non-positive).
 The constraints hold by construction through the parameterization of $z$.
 
 \paragraph{Mapping raw outputs to deltas.}
@@ -299,6 +306,12 @@ where $\sigma(\cdot)$ is the logistic sigmoid.
 For EOS (free sign, either direction):
 \[
 \delta_{\text{EOS}} = \delta_{\max}\tanh(z_{k+1})
+\;\in\; [-\delta_{\max},\,\delta_{\max}].
+\]
+
+For EOT (free sign, either direction):
+\[
+\delta_{\text{EOT}} = \delta_{\max}\tanh(z_{k+2})
 \;\in\; [-\delta_{\max},\,\delta_{\max}].
 \]
 
@@ -328,9 +341,17 @@ b[\text{EOS}] \;\mathrel{+}=\; \delta_{\text{EOS}}.
 \]
 This is applied at every decoding step, independently of $V_{\text{steer}}$.
 
+\paragraph{EOT steering.}
+\label{sec:eot-steering}
+The end-of-turn token ($\mathrm{EOT\_ID}$) receives its own dedicated
+additive bias, applied unconditionally at every decoding step:
+\[
+b[\mathrm{EOT\_ID}] \;\mathrel{+}=\; \delta_{\text{EOT}}.
+\]
+
 \paragraph{Operational procedure during generation.}
-The bias vector $b$ is built once from $\boldsymbol{\delta}$
-and the fixed set $V_{\text{steer}}$ --- it is a simple lookup table indexed by token id.
+The bias vector $b$ is built once from $\boldsymbol{\delta}$,
+the fixed set $V_{\text{steer}}$, and the dedicated EOS and EOT terms --- it is a simple lookup table indexed by token id.
 No trie or automaton is needed.
 
 \subsection{Training objective}
@@ -360,10 +381,10 @@ Let the target LLM define next-token probabilities
 P_{\text{LLM}}(v \mid \pi) \quad\text{for token } v\in V \text{ given prefix } \pi.
 \]
 
-From the global parameters $\boldsymbol{\delta}\in\mathbb{R}^{k+1}$,
+From the global parameters $\boldsymbol{\delta}\in\mathbb{R}^{k+2}$,
 a single bias vector $b\in\mathbb{R}^{|V|}$
 is \textbf{deterministically} computed via a per-token lookup into $V_{\text{steer}}$
-(see Sections~\ref{sec:bias-rule} and~\ref{sec:eos-steering}).
+(see Sections~\ref{sec:bias-rule}, \ref{sec:eos-steering}, and~\ref{sec:eot-steering}).
 The same $b$ is applied at every decoding step.
 Let $\pi_t := (c,q,y_{1:t-1})$ denote the prefix at step $t$.
 
@@ -386,12 +407,13 @@ Then the teacher-forced losses are:
 
 \paragraph{Conciseness surrogate (stop right after $\hat a^{\text{comp}}$).}
 \[
-\mathcal{L}_{\text{EOS}}(\boldsymbol{\delta};\, x)
-\;=\;
--\log P^{(b)}_{\text{LLM}}\!\big(\text{EOS} \mid \pi_{T+1}\big),
+\mathcal{L}_{\text{EOT}}(\boldsymbol{\delta};\, x)
+\;:=\;
+-\log P^{(b)}_{\text{LLM}}\!\big(\mathrm{EOT\_ID} \mid \pi_{T+1}\big),
 \qquad
 \pi_{T+1}:=(c,q,y_{1:T}).
 \]
+$\lambda_{\text{stop}}$ multiplies $\mathcal{L}_{\text{EOT}}$.
 
 \paragraph{Regularization (keep biases small).}
 \[
@@ -405,7 +427,7 @@ Then the teacher-forced losses are:
 \ell(\boldsymbol{\delta};\, x)
 \;=\;
 \lambda_{\text{task}}\,\mathcal{L}_{\text{NLL}}(\boldsymbol{\delta};\, x)
-\;+\;\lambda_{\text{stop}}\,\mathcal{L}_{\text{EOS}}(\boldsymbol{\delta};\, x)
+\;+\;\lambda_{\text{stop}}\,\mathcal{L}_{\text{EOT}}(\boldsymbol{\delta};\, x)
 \;+\;\lambda_{\delta}\,\mathcal{L}_{\text{reg}}(\boldsymbol{\delta};\, x).
 \]
 
@@ -492,12 +514,14 @@ The Target model weights and tokenizer are both loaded from \texttt{target\_mode
 \end{itemize}
 
 \subsection{Phase 1: Delta Learning (Global Parameters)}
+Saved/loaded Phase~1 parameters (for checkpoints and inference): $\{\delta_v : v \in V_{\text{steer}}\} \cup \{\delta_{\text{EOS}}, \delta_{\text{EOT}}\}$ (or equivalently the raw $z \in \mathbb{R}^{k+2}$).
 \begin{itemize}[leftmargin=2em]
   \item \texttt{phase1.steer\_tokens\_path} --- path to the Phase~0 selected-token artifact to load (str).
   \item \texttt{phase1.delta\_max} --- maximum magnitude $\delta_{\max}$ used in the sign-constrained parameterization (float).
   \item \texttt{phase1.k} --- number of steering tokens; must match Phase~0 (int).
   \item \texttt{phase1.init.z\_steer} --- initial value for $z_1,\dots,z_k$ (steering-token raw parameters); all $k$ entries share this scalar (float).
   \item \texttt{phase1.init.z\_eos} --- initial value for $z_{k+1}$ (EOS raw parameter), separate from steering (float).
+  \item \texttt{phase1.init.z\_eot} --- initial value for $z_{k+2}$ (EOT raw parameter), separate from steering and EOS (float).
 \end{itemize}
 
 \subsection{Training}
@@ -516,7 +540,7 @@ The Target model weights and tokenizer are both loaded from \texttt{target\_mode
 \subsection{Loss Weights}
 \begin{itemize}[leftmargin=2em]
   \item \texttt{loss.lambda\_task} --- weight $\lambda_{\text{task}}$ for $\mathcal{L}_{\text{NLL}}$ (float).
-  \item \texttt{loss.lambda\_stop} --- weight $\lambda_{\text{stop}}$ for $\mathcal{L}_{\text{EOS}}$ (float).
+  \item \texttt{loss.lambda\_stop} --- weight $\lambda_{\text{stop}}$ for $\mathcal{L}_{\text{EOT}}$ (float).
   \item \texttt{loss.lambda\_delta} --- weight $\lambda_{\delta}$ for $\mathcal{L}_{\text{reg}}$ (float).
   \item \texttt{loss.regularization\_target} --- what to regularize: \texttt{"deltas"} ($\|\boldsymbol{\delta}\|_2^2$) (str).
   \item \texttt{loss.use\_ranking\_loss} --- whether to include $\mathcal{L}_{\text{rank}}$ (bool).

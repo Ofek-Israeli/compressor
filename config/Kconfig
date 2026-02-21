@@ -1,0 +1,362 @@
+#
+# Phase 0 Data Collection Configuration
+#
+# Use 'make menuconfig' for interactive configuration.
+#
+
+mainmenu "Phase 0 Data Collection (Compressor)"
+
+#
+# General
+#
+menu "General"
+
+config SEED
+	int "Global random seed"
+	default 42
+	help
+	  Random seed for dataset splitting (shuffle).
+
+config DEVICE
+	string "Compute device"
+	default "cuda:0"
+	help
+	  Device for tokenizer/offline use (e.g. cuda:0, cpu).
+
+config OUTPUT_DIR
+	string "Output directory"
+	default "./outputs/phase0"
+	help
+	  Root directory for all artifacts (checkpoints, logs).
+
+choice
+	prompt "Log level"
+	default LOG_LEVEL_INFO
+
+config LOG_LEVEL_DEBUG
+	bool "DEBUG"
+config LOG_LEVEL_INFO
+	bool "INFO"
+config LOG_LEVEL_WARNING
+	bool "WARNING"
+
+endchoice
+
+endmenu
+
+#
+# Target (SGLang)
+#
+menu "Target (SGLang)"
+
+config TARGET_MODEL_ID
+	string "Target model ID"
+	default "meta-llama/Llama-3.1-8B-Instruct"
+	help
+	  HuggingFace model id. Source of tokenizer; must match SGLang server.
+
+config TARGET_SGLANG_BASE_URL
+	string "SGLang server base URL"
+	default "http://localhost:8000"
+	help
+	  Base URL of the local SGLang server.
+
+config TARGET_SGLANG_TIMEOUT_S
+	int "SGLang request timeout (seconds)"
+	default 120
+	help
+	  Request timeout for SGLang client.
+
+config TARGET_SGLANG_MAX_RETRIES
+	int "SGLang max retries"
+	default 3
+	help
+	  Number of retries on transient failure.
+
+config TARGET_TEMPERATURE
+	string "Target sampling temperature"
+	default "0.7"
+	help
+	  Sampling temperature for Target generation.
+
+config TARGET_TOP_P
+	string "Target nucleus sampling top_p"
+	default "0.95"
+	help
+	  Nucleus sampling p for Target.
+
+config TARGET_MAX_NEW_TOKENS
+	int "Target max new tokens"
+	default 512
+	help
+	  Max tokens per Target generation.
+
+config TARGET_SEED
+	int "Target sampling seed"
+	default 42
+	help
+	  Seed for Target sampling (mandatory).
+
+config TARGET_PROMPT_TEMPLATE
+	string "Target prompt template"
+	default "Context:|{context}|Question:|{query}|Answer:"
+	help
+	  Template for (context, query). Placeholders: {context}, {query}.
+	  Use | as line separator (converted to newline at runtime).
+
+endmenu
+
+#
+# Reflector (OpenAI Chat)
+#
+menu "Reflector (OpenAI Chat)"
+
+config REFLECTOR_MODEL_ID
+	string "Reflector model ID"
+	default "gpt-4o"
+	help
+	  OpenAI API model name for compression.
+
+config REFLECTOR_API
+	string "Reflector API type"
+	default "openai_chat_completions"
+	help
+	  Endpoint type (openai_chat_completions).
+
+config REFLECTOR_TEMPERATURE
+	string "Reflector temperature"
+	default "0.0"
+	help
+	  Sampling temperature for Reflector.
+
+config REFLECTOR_TOP_P
+	string "Reflector top_p"
+	default "1.0"
+	help
+	  Nucleus sampling p for Reflector.
+
+config REFLECTOR_MAX_NEW_TOKENS
+	int "Reflector max new tokens"
+	default 256
+	help
+	  Max tokens per Reflector compression call.
+
+config REFLECTOR_SEED
+	int "Reflector sampling seed"
+	default 42
+	help
+	  Seed for Reflector sampling.
+
+config REFLECTOR_API_BASE
+	string "Reflector API base URL"
+	default "https://api.openai.com/v1"
+	help
+	  Base URL for OpenAI Chat Completions.
+
+config REFLECTOR_API_KEY_ENV
+	string "Reflector API key env var name"
+	default "OPENAI_API_KEY"
+	help
+	  Environment variable holding the API key.
+
+endmenu
+
+#
+# Data
+#
+menu "Data"
+
+config DATA_FINANCEBENCH_PATH
+	string "FinanceBench JSONL path"
+	default "/path/to/financebench_open_source.jsonl"
+	help
+	  Path to financebench_open_source.jsonl.
+
+config DATA_SPLIT_RATIOS_TRAIN
+	string "Train split ratio"
+	default "0.70"
+	help
+	  Fraction for training (train+val+test must sum to 1.0).
+
+config DATA_SPLIT_RATIOS_VAL
+	string "Validation split ratio"
+	default "0.15"
+	help
+	  Fraction for validation.
+
+config DATA_SPLIT_RATIOS_TEST
+	string "Test split ratio"
+	default "0.15"
+	help
+	  Fraction for test.
+
+config DATA_USE_EXPLICIT_INDICES
+	bool "Use explicit train/val/test indices"
+	default n
+	help
+	  If set, split by comma-separated 0-based indices instead of ratios.
+	  Indices refer to JSONL line order (first line = 0).
+
+config DATA_TRAIN_INDICES
+	string "Train indices (0-based, comma-separated)"
+	default ""
+	depends on DATA_USE_EXPLICIT_INDICES
+	help
+	  e.g. "0,1,2,5,10" for specific samples as train set.
+
+config DATA_VAL_INDICES
+	string "Validation indices (0-based, comma-separated)"
+	default ""
+	depends on DATA_USE_EXPLICIT_INDICES
+	help
+	  e.g. "3,4,6" for validation set.
+
+config DATA_TEST_INDICES
+	string "Test indices (0-based, comma-separated)"
+	default ""
+	depends on DATA_USE_EXPLICIT_INDICES
+	help
+	  e.g. "7,8,9" for test set.
+
+endmenu
+
+#
+# Phase 0
+#
+menu "Phase 0"
+
+config PHASE0_VERBOSE_NUM_SAMPLES
+	int "Verbose samples per example (M)"
+	default 5
+	help
+	  Number of Target verbose answers per (c,q).
+
+config PHASE0_K
+	int "Top-k fluff tokens"
+	default 50
+	help
+	  Number of top-k tokens to select by frequency difference.
+
+config PHASE0_OUTPUT_PATH
+	string "Phase 0 output JSON path"
+	default "./outputs/phase0/phase0_data.json"
+	help
+	  Path for the output JSON file.
+
+config PHASE0_TARGET_CONCURRENCY
+	int "Target (SGLang) concurrency"
+	default 1
+	help
+	  Max concurrent Target requests.
+
+config PHASE0_REFLECTOR_CONCURRENCY
+	int "Reflector concurrency"
+	default 4
+	help
+	  Max concurrent Reflector requests.
+
+config PHASE0_JUDGE_CONCURRENCY
+	int "Judge concurrency"
+	default 4
+	help
+	  Max concurrent judge (correctness) requests.
+
+endmenu
+
+#
+# Phase 0 filters
+#
+menu "Phase 0 token filters"
+
+config PHASE0_FILTERS_DROP_SPECIAL_TOKENS
+	bool "Drop special tokens"
+	default y
+	help
+	  Exclude special/control tokens from candidate set.
+
+config PHASE0_FILTERS_DROP_WHITESPACE_ONLY
+	bool "Drop whitespace/punctuation-only tokens"
+	default y
+	help
+	  Exclude whitespace-only and punctuation-only tokens.
+
+config PHASE0_FILTERS_DROP_DIGIT_ONLY
+	bool "Drop digit-only tokens"
+	default y
+	help
+	  Exclude digit-only tokens from candidate set.
+
+endmenu
+
+#
+# Phase 0 correctness (judge)
+#
+menu "Phase 0 correctness (judge)"
+
+config PHASE0_CORRECTNESS_METRIC
+	string "Correctness metric name"
+	default "remote_verdict"
+	help
+	  Metric for judging compressed vs gold (e.g. remote_verdict).
+
+config PHASE0_CORRECTNESS_THRESHOLD
+	string "Correctness threshold"
+	default "0.5"
+	help
+	  Minimum metric score for a compressed answer to be correct.
+
+config PHASE0_CORRECTNESS_TOLERANCE
+	string "Numerical tolerance (e.g. 0.15 = 15%%)"
+	default "0.15"
+	help
+	  Relative error tolerance for numerical answers.
+
+config PHASE0_CORRECTNESS_EVALUATOR_MODEL
+	string "Judge model ID"
+	default "gpt-4o"
+	help
+	  LLM used as correctness judge.
+
+config PHASE0_CORRECTNESS_EVALUATOR_API_BASE
+	string "Judge API base URL"
+	default "https://api.openai.com/v1"
+	help
+	  API base URL for the judge.
+
+config PHASE0_CORRECTNESS_EVALUATOR_API_KEY_ENV
+	string "Judge API key env var name"
+	default "OPENAI_API_KEY"
+	help
+	  Environment variable for judge API key.
+
+config PHASE0_CORRECTNESS_QUALITATIVE_FORGIVING
+	bool "Qualitative forgiving evaluation"
+	default y
+	help
+	  Use forgiving evaluation for qualitative questions.
+
+config PHASE0_CORRECTNESS_EVALUATOR_TEMPERATURE
+	string "Judge temperature"
+	default "0.0"
+	help
+	  Sampling temperature for the judge LLM.
+
+config PHASE0_CORRECTNESS_EVALUATOR_TOP_P
+	string "Judge top_p"
+	default "1.0"
+	help
+	  Nucleus sampling p for the judge.
+
+config PHASE0_CORRECTNESS_EVALUATOR_MAX_NEW_TOKENS
+	int "Judge max new tokens"
+	default 512
+	help
+	  Max tokens per judge call.
+
+config PHASE0_CORRECTNESS_EVALUATOR_SEED
+	int "Judge sampling seed"
+	default 42
+	help
+	  Seed for judge sampling.
+
+endmenu

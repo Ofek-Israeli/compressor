@@ -55,6 +55,13 @@ def load_financebench(jsonl_path: str) -> List[Example]:
     return examples
 
 
+def parse_indices(indices_str: str) -> List[int]:
+    """Parse comma-separated indices string into list of non-negative integers (0-based)."""
+    if not indices_str or not str(indices_str).strip():
+        return []
+    return [int(x.strip()) for x in str(indices_str).strip().split(",") if x.strip()]
+
+
 def split_train_val_test(
     examples: List[Example],
     seed: int,
@@ -72,4 +79,25 @@ def split_train_val_test(
     train = sorted_ex[:t]
     val = sorted_ex[t : t + v]
     test = sorted_ex[t + v :]
+    return train, val, test
+
+
+def split_train_val_test_explicit(
+    examples: List[Example],
+    train_indices: List[int],
+    val_indices: List[int],
+    test_indices: List[int],
+) -> Tuple[List[Example], List[Example], List[Example]]:
+    """Split by explicit 0-based indices into the examples list (JSONL order).
+    Each index must be in [0, len(examples)); overlapping indices are allowed but usually undesired.
+    """
+    n = len(examples)
+    for idx in train_indices + val_indices + test_indices:
+        if idx < 0 or idx >= n:
+            raise ValueError(
+                f"Index {idx} out of range [0, {n}); examples list has {n} items (0-based JSONL order)"
+            )
+    train = [examples[i] for i in train_indices]
+    val = [examples[i] for i in val_indices]
+    test = [examples[i] for i in test_indices]
     return train, val, test

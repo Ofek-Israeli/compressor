@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Phase 0 data collection: FinanceBench → Target (SGLang) verbose → Reflector (OpenAI) compress
-→ correctness filter → tokenize → freq/delta → top-k → output JSON.
+→ correctness filter → tokenize → frequency difference → top-k → output JSON.
 See docs/phase0.md. No defaults, no fallbacks; all from kconfig.
 """
 
@@ -30,11 +30,18 @@ except ImportError:
     MinionsUsage = None
 
 from compressor.config import load_and_validate
-from compressor.data import load_financebench, split_train_val_test, Example
+from compressor.data import (
+    load_financebench,
+    split_train_val_test,
+    split_train_val_test_explicit,
+    parse_indices,
+    Example,
+)
 from compressor.sglang_client import SGLangClient
 from compressor.openai_chat import OpenAIChatClient, Usage
 from compressor.token_utils import (
     load_tokenizer,
+    get_stop_token_ids,
     tokenize,
     filter_candidate_tokens,
     compute_freq_and_delta,
@@ -43,6 +50,19 @@ from compressor.token_utils import (
 
 LOG = logging.getLogger(__name__)
 
+REFLECTOR_COMPRESS_PROMPT_TEMPLATE = """
+You will be given a question and an assistant answer. Rewrite the answer in the fewest words while preserving its meaning. Remove all fluff, padding, hedging, and redundancy. Output ONLY the rewritten answer—no preamble, no bullets unless essential, no explanations.
+
+Question:
+{query}
+
+Assistant answer:
+{prev_answer}
+
+Rewritten answer:
+"""
+
+# Reflector compression prompt (query + verbose answer → rewritten answer). Not configurable.
 
 def _run_target_verbose(
     cfg: dict,
@@ -70,11 +90,29 @@ def _run_target_verbose(
 
     todo = [ex for ex in train if ex["example_id"] not in out or len(out[ex["example_id"]]) < M]
     if not todo:
+        LOG.info("Target verbose: all %s examples already have answers (skip)", len(train))
         return out
 
+    tok = load_tokenizer(cfg["target"]["model_id"])
+    stop_token_ids = get_stop_token_ids(tok)
+    LOG.info("Target verbose: stop_token_ids=%s", stop_token_ids)
+
+    LOG.info(
+        "Target verbose: generating for %s examples (%s samples each), concurrency=%s",
+        len(todo), M, concurrency,
+    )
+
     def one_example(ex: Example):
+        eid = ex["example_id"]
+        LOG.info("Target verbose: starting example %s", eid)
         c, q = ex["context"], ex["query"]
-        prompt = template.format(context=c, query=q)
+        user_body = template.format(context=c, query=q)
+        messages = [
+            {"role": "system", "content": "Answer the question using the provided context."},
+            {"role": "user",   "content": user_body},
+        ]
+        prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        LOG.info("Target verbose: sending %s requests for example %s (prompt_len=%s)", M, eid, len(prompt))
         answers = []
         for _ in range(M):
             text = sglang.generate(
@@ -83,15 +121,21 @@ def _run_target_verbose(
                 top_p=float(cfg["target"]["top_p"]),
                 max_new_tokens=int(cfg["target"]["max_new_tokens"]),
                 seed=target_seed,
+                stop_token_ids=stop_token_ids,
             )
             answers.append(text)
         return ex["example_id"], answers
 
+    done = 0
     with ThreadPoolExecutor(max_workers=concurrency) as exe:
         futures = {exe.submit(one_example, ex): ex for ex in todo}
+        LOG.info("Target verbose: submitted %s tasks, waiting for completions...", len(futures))
         for fut in as_completed(futures):
             eid, answers = fut.result()
             out[eid] = answers
+            done += 1
+            if done % 10 == 0 or done == len(todo):
+                LOG.info("Target verbose: %s / %s examples done", done, len(todo))
             with open(resume_verbose_path, "a") as f:
                 f.write(json.dumps({"example_id": eid, "verbose_answers": answers}) + "\n")
     return out
@@ -106,7 +150,6 @@ def _run_reflector_compress(
 ) -> dict:
     """For each (ex, pair_idx) not in compressed_by_key, compress via Reflector. Returns (example_id, pair_idx) -> compressed text."""
     out = compressed_by_key if compressed_by_key is not None else {}
-    template = cfg["reflector"]["compress_prompt_template"]
     concurrency = int(cfg["phase0"]["reflector_concurrency"])
 
     tasks = [(ex, v, i) for ex in train for i, v in enumerate(verbose_by_id.get(ex["example_id"], [])) if (ex["example_id"], i) not in out]
@@ -114,7 +157,7 @@ def _run_reflector_compress(
         return out
 
     def one_pair(ex: Example, verbose: str, pair_idx: int):
-        prompt = template.format(query=ex["query"], prev_answer=verbose)
+        prompt = REFLECTOR_COMPRESS_PROMPT_TEMPLATE.format(query=ex["query"], prev_answer=verbose)
         messages = [{"role": "user", "content": prompt}]
         resp, _ = reflector_client.chat(messages)
         return (ex["example_id"], pair_idx), resp[0] if resp else ""
@@ -232,16 +275,37 @@ def main():
 
     # Data
     examples = load_financebench(cfg["data"]["financebench_path"])
-    ratios = cfg["data"]["split_ratios"]
+    data_cfg = cfg["data"]
     seed = int(cfg["seed"])
-    train, val, test = split_train_val_test(
-        examples,
-        seed,
-        float(ratios["train"]),
-        float(ratios["val"]),
-        float(ratios["test"]),
-    )
-    LOG.info("split: train=%s val=%s test=%s", len(train), len(val), len(test))
+    if data_cfg.get("use_explicit_indices"):
+        train_s = (data_cfg.get("train_indices") or "").strip()
+        val_s = (data_cfg.get("val_indices") or "").strip()
+        test_s = (data_cfg.get("test_indices") or "").strip()
+        if not train_s:
+            raise ValueError(
+                "data.use_explicit_indices is true but data.train_indices is empty; "
+                "set train indices (comma-separated 0-based). Val/test may be empty."
+            )
+        train_idx = parse_indices(train_s)
+        val_idx = parse_indices(val_s) if val_s else []
+        test_idx = parse_indices(test_s) if test_s else []
+        train, val, test = split_train_val_test_explicit(
+            examples, train_idx, val_idx, test_idx
+        )
+        LOG.info(
+            "split (explicit indices): train=%s val=%s test=%s",
+            len(train), len(val), len(test),
+        )
+    else:
+        ratios = data_cfg["split_ratios"]
+        train, val, test = split_train_val_test(
+            examples,
+            seed,
+            float(ratios["train"]),
+            float(ratios["val"]),
+            float(ratios["test"]),
+        )
+        LOG.info("split: train=%s val=%s test=%s", len(train), len(val), len(test))
 
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -257,6 +321,9 @@ def main():
         timeout_s=float(cfg["target"]["sglang"]["timeout_s"]),
         max_retries=int(cfg["target"]["sglang"]["max_retries"]),
     )
+    if not sglang.health_check():
+        LOG.error("Cannot reach SGLang server at %s — aborting", cfg["target"]["sglang"]["base_url"])
+        return 1
     verbose_by_id = _run_target_verbose(cfg, train, sglang, resume_verbose, resume=args.resume)
     LOG.info("Target verbose: %s examples with answers", len(verbose_by_id))
 
@@ -319,7 +386,7 @@ def main():
         for v, c, r in pairs_ok:
             retained.append((v, c, w))
 
-    # Tokenize and freq/delta
+    # Tokenize and compute frequency difference (verbose vs compressed)
     tok = load_tokenizer(cfg["target"]["model_id"])
     filters = cfg["phase0"]["filters"]
     candidates = filter_candidate_tokens(
@@ -333,7 +400,7 @@ def main():
     ]
     k = int(cfg["phase0"]["k"])
     top_ids, delta, freq_raw, freq_comp = compute_freq_and_delta(retained_with_tokens, k, candidates)
-    v_steer, v_steer_token_ids, delta_by_token_id = build_v_steer_and_delta_by_id(tok, top_ids, delta)
+    v_steer, v_steer_token_ids, frequency_difference_by_token_id = build_v_steer_and_delta_by_id(tok, top_ids, delta)
 
     # Add token_ids to retained_pairs in train_output
     for ex in train_output:
@@ -366,7 +433,7 @@ def main():
             "k": len(v_steer_token_ids),
             "v_steer": v_steer,
             "v_steer_token_ids": v_steer_token_ids,
-            "delta_by_token_id": delta_by_token_id,
+            "frequency_difference_by_token_id": frequency_difference_by_token_id,
             "freq_raw": {str(t): freq_raw.get(t, 0) for t in v_steer_token_ids},
             "freq_comp": {str(t): freq_comp.get(t, 0) for t in v_steer_token_ids},
         },
