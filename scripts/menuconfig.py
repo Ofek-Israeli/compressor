@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Terminal menu to create or edit the phase0 YAML config.
-Run via: make menuconfig   or   python scripts/menuconfig.py [CONFIG_PATH]
+GUI or terminal menu to create or edit the phase0 YAML config.
+Run via: make menuconfig   or   python scripts/menuconfig.py [CONFIG_PATH] [--tui]
+  Default: GUI (tkinter). Use --tui for terminal menu.
 """
 
 import sys
@@ -177,6 +178,144 @@ def format_display_value(path: str, value) -> str:
     return s
 
 
+def _run_gui(config_path: Path) -> None:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, scrolledtext
+
+    cfg = load_config(config_path)
+    config_path = config_path.resolve()
+
+    root = tk.Tk()
+    root.title("Phase 0 Config — menuconfig")
+    root.minsize(700, 500)
+    root.geometry("900x600")
+
+    # Path label
+    path_frame = ttk.Frame(root, padding=4)
+    path_frame.pack(fill=tk.X)
+    ttk.Label(path_frame, text="Config:", font=("", 9)).pack(side=tk.LEFT)
+    ttk.Label(path_frame, text=str(config_path), font=("", 9), foreground="gray").pack(side=tk.LEFT, padx=4)
+
+    # Paned: left = sections, right = form
+    paned = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
+    paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+    # Left: section list
+    left = ttk.Frame(paned)
+    paned.add(left, weight=0)
+    ttk.Label(left, text="Section").pack(anchor=tk.W)
+    listbox = tk.Listbox(left, height=20, width=22, font=("", 11), selectmode=tk.SINGLE, exportselection=False)
+    listbox.pack(fill=tk.BOTH, expand=True, pady=4)
+    for name, _ in SECTIONS:
+        listbox.insert(tk.END, name)
+    listbox.selection_set(0)
+
+    # Right: scrollable form
+    right = ttk.Frame(paned)
+    paned.add(right, weight=1)
+    form_container = ttk.Frame(right)
+    form_container.pack(fill=tk.BOTH, expand=True)
+    canvas = tk.Canvas(form_container)
+    scrollbar = ttk.Scrollbar(form_container)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.config(command=canvas.yview)
+    canvas.config(yscrollcommand=scrollbar.set)
+    form_inner = ttk.Frame(canvas)
+    canvas_window = canvas.create_window((0, 0), window=form_inner, anchor=tk.NW)
+
+    def _on_frame_configure(_event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _on_canvas_configure(event):
+        canvas.itemconfig(canvas_window, width=event.width)
+
+    form_inner.bind("<Configure>", _on_frame_configure)
+    canvas.bind("<Configure>", _on_canvas_configure)
+
+    # Widgets per path: path -> (widget or var, typ)
+    widgets: dict = {}
+
+    def build_form(section_index: int) -> None:
+        for w in form_inner.winfo_children():
+            w.destroy()
+        widgets.clear()
+        _, keys = SECTIONS[section_index]
+        for path in keys:
+            typ = KEY_TYPE.get(path, "str")
+            val = _get(cfg, path)
+            row = ttk.Frame(form_inner)
+            row.pack(fill=tk.X, pady=2)
+            label = path  # use full path as label
+            ttk.Label(row, text=label, width=42, anchor=tk.W).pack(side=tk.LEFT, padx=(0, 8))
+            if typ == "bool":
+                var = tk.BooleanVar(value=bool(val))
+                w = ttk.Checkbutton(row, variable=var)
+                w.pack(side=tk.LEFT)
+                widgets[path] = (var, typ)
+            else:
+                sval = str(val) if val is not None else ""
+                if "template" in path.lower() or "prompt" in path.lower():
+                    e = scrolledtext.ScrolledText(row, height=3, width=40, wrap=tk.WORD, font=("", 10))
+                    e.insert("1.0", sval)
+                    e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                    widgets[path] = (e, typ)
+                else:
+                    e = ttk.Entry(row, width=40)
+                    e.insert(0, sval)
+                    e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                    widgets[path] = (e, typ)
+
+    def on_select(_event=None) -> None:
+        sel = listbox.curselection()
+        if sel:
+            flush_to_config()  # save current section edits before switching
+            build_form(sel[0])
+
+    def flush_to_config() -> None:
+        for path, (w, typ) in widgets.items():
+            try:
+                if typ == "bool":
+                    val = w.get()
+                elif isinstance(w, tk.Text):
+                    val = w.get("1.0", tk.END).strip()
+                else:
+                    val = w.get().strip()
+                if typ != "bool" and val == "":
+                    continue
+                if typ != "str":
+                    val = _parse_value(str(val), typ)
+                _set_by_path(cfg, path, val)
+            except Exception:
+                pass
+
+    def on_save() -> None:
+        flush_to_config()
+        try:
+            save_config(cfg, config_path)
+            load_and_validate(str(config_path))
+            messagebox.showinfo("Saved", f"Config saved and validated:\n{config_path}")
+            root.destroy()
+        except Exception as e:
+            if messagebox.askyesno("Validation failed", f"{e}\n\nSave anyway?"):
+                save_config(cfg, config_path)
+                messagebox.showinfo("Saved", f"Saved (validation failed):\n{config_path}")
+                root.destroy()
+
+    def on_cancel() -> None:
+        root.destroy()
+
+    listbox.bind("<<ListboxSelect>>", on_select)
+    build_form(0)
+
+    btn_frame = ttk.Frame(root, padding=4)
+    btn_frame.pack(fill=tk.X)
+    ttk.Button(btn_frame, text="Save", command=on_save).pack(side=tk.LEFT, padx=2)
+    ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=2)
+
+    root.mainloop()
+
+
 def run_menu(config_path: Path) -> None:
     cfg = load_config(config_path)
 
@@ -247,10 +386,31 @@ def run_menu(config_path: Path) -> None:
 
 
 def main():
+    args = [a for a in sys.argv[1:] if a != "--tui" and not a.startswith("-")]
+    use_tui = "--tui" in sys.argv
     default_path = _repo_root / "config.yaml"
-    config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else default_path
+    config_path = Path(args[0]) if args else default_path
     config_path = config_path.resolve()
-    run_menu(config_path)
+
+    if use_tui:
+        run_menu(config_path)
+        return
+
+    import tkinter
+    try:
+        _run_gui(config_path)
+    except tkinter.TclError as e:
+        if "display" in str(e).lower() or "cannot open" in str(e).lower():
+            print("GUI not available (no display), falling back to TUI.", file=sys.stderr)
+            run_menu(config_path)
+        else:
+            raise
+    except Exception as e:
+        if "tk" in str(type(e).__name__).lower():
+            print("GUI failed, falling back to TUI:", e, file=sys.stderr)
+            run_menu(config_path)
+        else:
+            raise
 
 
 if __name__ == "__main__":
