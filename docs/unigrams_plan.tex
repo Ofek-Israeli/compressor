@@ -1,0 +1,536 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, fit, backgrounds}
+
+\title{Plan: Learned Logit Bias via Unigram Axis Discovery + Delta Learning}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Goal}
+Learn a \emph{logit bias / logit processor} for a frozen \textbf{target model} (smaller LLM) that encourages \textbf{concise} yet \textbf{correct} QA outputs.
+The compressed answers used as training signal are produced by a
+\textbf{larger reflector LLM}, so the overall pipeline is a form of
+\textbf{knowledge distillation}: the bigger model teaches the smaller
+model \emph{where to be concise} via learned logit biases.
+
+\paragraph{Training data.}
+Examples are $(c,q,a^*)$ where $c$ is context, $q$ is query, and $a^*$ is a concise ground-truth answer.
+\textbf{Important:} $a^*$ is used \emph{only} to judge whether a
+reflector-compressed answer is correct; it is \emph{never} used as a
+training target for the bias parameters.
+
+\section{Notation}
+Let $V$ be the target model vocabulary and $\texttt{tok}(\cdot)$ be the target model tokenizer.
+Given a generated answer $\hat a$, let $\mathrm{Len}(\hat a)$ be its output length (tokens), and $\mathrm{Err}(\hat a,a^*)$ be an error metric (e.g., exact match / $1-\mathrm{F1}$).
+
+Phase~0 selects $k$ ``fluff'' tokens $V_{\text{steer}}\subset V$.
+We learn one steering magnitude per selected token, plus a dedicated EOS magnitude:
+\[
+\boldsymbol{\delta}=(\delta_{v_1},\dots,\delta_{v_k},\;\delta_{\text{EOS}}),
+\qquad v_i \in V_{\text{steer}}.
+\]
+
+\section{Phase 0: Token selection via Target verbose answers + Reflector compression}
+
+\subsection{Goal}
+Identify the $k$ tokens (unigrams) whose frequency drops the most when a
+verbose answer is compressed.
+The \textbf{Target model} produces verbose answers; the \textbf{Reflector}
+produces compressed rewrites of those Target answers.
+Correctness filtering is applied on the compressed version; all token
+statistics are computed using the Target tokenizer.
+These ``fluff'' tokens become the steering targets in Phase~1.
+
+\subsection{Inputs}
+Training data: $\{(c,q,a^*)\}$ where $a^*$ is a concise ground-truth answer.\\
+Target model (frozen): provides the tokenizer $\texttt{tok}(\cdot)$ and
+vocabulary $V$.
+The Target model and tokenizer are both loaded from \texttt{target\_model\_id}; they must match (see \S\ref{sec:kconfig}).\\
+Reflector LLM: a (possibly larger) LLM used only to compress Target-generated verbose answers (chosen in kconfig).
+
+\subsection{System prompts}
+\label{sec:reflector-prompts}
+The system uses exactly two prompts, defined verbatim below.
+
+\paragraph{(4.1) Target verbose-answer prompt.}
+Inputs: $\{\texttt{context}\}$, $\{\texttt{query}\}$.
+This is exactly \texttt{target.prompt\_template} (see \S\ref{sec:kconfig}).
+
+\medskip
+\noindent\textbf{SYSTEM / INSTRUCTION:}\\
+You are given a document excerpt (context) and a question (query). Answer the question as completely as needed. Do not compress; verbosity is allowed. Ground your answer in the context when possible.
+
+\medskip
+\noindent\textbf{FORMAT:}\\
+\texttt{Context:}\\
+\texttt{\{context\}}\\
+\texttt{Question:}\\
+\texttt{\{query\}}\\
+\texttt{Answer:}
+
+\paragraph{(4.2) Reflector compression prompt.}
+Inputs: $\{\texttt{query}\}$, $\{\texttt{prev\_answer}\}$.
+
+\medskip
+\noindent\textbf{SYSTEM / INSTRUCTION:}\\
+Look at this question and your previous answer. Extract the core point and rewrite it in the fewest words---remove all fluff, padding, and redundancy. Preserve meaning. Output only the rewritten answer.
+
+\medskip
+\noindent\textbf{FORMAT:}\\
+\texttt{Question:}\\
+\texttt{\{query\}}\\
+\texttt{Previous answer:}\\
+\texttt{\{prev\_answer\}}\\
+\texttt{Rewritten answer:}
+
+\subsection{Procedure}
+
+\subsection*{Step 1: Generate verbose answers (Target model only)}
+For each $(c,q)$, serialize $(c,q)$ using \texttt{target.prompt\_template}
+(Sec.~\ref{sec:reflector-prompts}, 4.1) and sample
+$M_{\text{verbose}}$ independent Target answers
+($M_{\text{verbose}}=$~\texttt{phase0.verbose\_num\_samples})
+using the Target generation parameters
+(\texttt{target\_model.temperature}, \texttt{target\_model.top\_p},
+\texttt{target\_model.max\_new\_tokens}):
+\[
+\hat a^{\text{verbose}}_{c,q,j}
+\;=\;
+\texttt{Target}\!\big(c,\,q;\;\text{target prompt}\big),
+\qquad j=1,\dots,M_{\text{verbose}}.
+\]
+The Reflector is \emph{not} queried in this step.
+
+\subsection*{Step 2: Compress each verbose answer (Reflector only)}
+For each Target-generated verbose answer $\hat a^{\text{verbose}}_{c,q,j}$,
+call the Reflector with \textbf{only} $\{q,\,\hat a^{\text{verbose}}_{c,q,j}\}$
+(no context) and the compression prompt
+(Sec.~\ref{sec:reflector-prompts}, 4.2; template key
+\texttt{phase0.reflector.compress\_prompt\_template}).
+This produces one compressed rewrite per verbose answer:
+\[
+\hat a^{\text{comp}}_{c,q,j}
+\;=\;
+\texttt{Reflector}\!\big(q,\,\hat a^{\text{verbose}}_{c,q,j};\;\text{compress prompt}\big),
+\qquad j=1,\dots,M_{\text{verbose}}.
+\]
+
+\subsection*{Step 2b: Correctness filter --- keep only correct compressions}
+Evaluate each \emph{compressed} answer against the gold answer $a^*$
+using a configurable metric (e.g.\ exact-match or F1, set in kconfig):
+\[
+\text{correct}_j
+\;:=\;
+\bigl[\mathrm{Metric}(\hat a^{\text{comp}}_{c,q,j},\;a^*) \ge \tau\bigr],
+\]
+where $\tau$ is a configurable threshold.
+Retain only the \emph{pairs} whose compressed answer is correct:
+\[
+\mathcal{P}(c,q)
+\;=\;
+\bigl\{\,
+  (\hat a^{\text{verbose}}_{c,q,j},\;\hat a^{\text{comp}}_{c,q,j})
+  : \text{correct}_j = \text{True}
+\bigr\},
+\qquad
+m_{c,q} \;:=\; \bigl|\mathcal{P}(c,q)\bigr|.
+\]
+Reindex the retained pairs for each $(c,q)$ as $i=1,\dots,m_{c,q}$.
+Examples with $m_{c,q}=0$ are discarded from all subsequent aggregation
+and from Phase~1 training (but may be logged for analysis).
+
+\paragraph{Per-example reweighting.}
+Each retained pair receives a sample weight
+\[
+w_{c,q} \;=\; \frac{1}{m_{c,q}},
+\]
+so that every original $(c,q)$ contributes a total weight of~$1$,
+regardless of how many pairs passed the filter.
+This prevents overweighting examples that happen to yield many valid
+compressions.
+
+\textbf{Note:} $a^*$ is used here \emph{solely} as a judge; the model
+never sees $a^*$ during gradient updates.
+
+\subsection*{Step 3: Tokenize verbose and compressed answers}
+The tokenizer is the single source of truth for all encode/decode/frequency/filtering.
+Define once (right after \texttt{tok} is introduced):
+\[
+\texttt{tok} \;:=\; \texttt{AutoTokenizer.from\_pretrained(target\_model\_id)},
+\quad
+\mathrm{Tok}(\hat a) \;:=\; \texttt{tok.encode}(\hat a,\;\texttt{add\_special\_tokens=False}),
+\quad
+\texttt{decode}(t) \;:=\; \texttt{tok.decode}([t]).
+\]
+Here $t$ is a token id (element of $\mathrm{Tok}(\cdot)$ output); $v$ in frequency formulas is interpreted as a token id.
+Frequency computations (Step~4) and token filters (Step~5) use this same tokenizer.
+
+For each retained pair
+$(\hat a^{\text{verbose}},\,\hat a^{\text{comp}})\in\mathcal{P}(c,q)$:
+\[
+x^{\text{verbose}} = \mathrm{Tok}(\hat a^{\text{verbose}})=(r_1,\dots,r_R),
+\qquad
+x^{\text{comp}} = \mathrm{Tok}(\hat a^{\text{comp}})=(s_1,\dots,s_S),
+\]
+with $r_i,s_j \in V$.
+
+\subsection*{Step 4: Compute token frequencies}
+Let $S = \{(c,q) : m_{c,q} > 0\}$.
+
+\paragraph{Raw (verbose) frequency (weighted).}
+Use the same per-example weights $w_{c,q}=1/m_{c,q}$ as for compressed:
+\[
+C_{\text{raw}}(v)
+\;=\;
+\sum_{(c,q)\in S}
+  \;\sum_{i=1}^{m_{c,q}} w_{c,q}\;\mathrm{count}(v \text{ in } \mathrm{Tok}(\hat a^{\text{verbose}}_{c,q,i})),
+\qquad
+Z_{\text{raw}}
+\;=\;
+\sum_{(c,q)\in S}
+  \;\sum_{i=1}^{m_{c,q}} w_{c,q}\;|\mathrm{Tok}(\hat a^{\text{verbose}}_{c,q,i})|,
+\]
+\[
+\mathrm{freq}_{\text{raw}}(v) \;:=\; \frac{C_{\text{raw}}(v)}{Z_{\text{raw}}}.
+\]
+
+\paragraph{Compressed frequency (weighted).}
+Use the per-example weights $w_{c,q}=1/m_{c,q}$ from Step~2b:
+\[
+C_{\text{comp}}(v)
+\;=\;
+\sum_{\substack{(c,q):\\m_{c,q}>0}}
+  \;\sum_{i=1}^{m_{c,q}} w_{c,q}\;\mathrm{count}(v \text{ in } \mathrm{Tok}(\hat a^{\text{comp}}_{c,q,i})),
+\qquad
+Z_{\text{comp}}
+\;=\;
+\sum_{\substack{(c,q):\\m_{c,q}>0}}
+  \;\sum_{i=1}^{m_{c,q}} w_{c,q}\;|\mathrm{Tok}(\hat a^{\text{comp}}_{c,q,i})|,
+\]
+where $|\mathrm{Tok}(\hat a^{\text{comp}}_{c,q,i})|$ is the token length of the $i$-th
+retained compression.
+Then:
+\[
+\mathrm{freq}_{\text{comp}}(v)
+\;=\;
+\frac{C_{\text{comp}}(v)}{Z_{\text{comp}}}.
+\]
+This weighting prevents examples with large $m_{c,q}$ from dominating
+$\Delta(v)$.
+
+\subsection*{Step 5: Compute the frequency difference and select top-$k$ tokens}
+For each token $v\in V$:
+\[
+\Delta(v) = \mathrm{freq}_{\text{raw}}(v) - \mathrm{freq}_{\text{comp}}(v).
+\]
+
+\textbf{Filter before ranking.}
+All filters use the Target tokenizer and $\texttt{decode}(t)$ as defined in Step~3.
+Apply the deterministic token filters (configured in kconfig) to obtain a
+candidate set $V' \subseteq V$:
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Drop special tokens:} remove all tokenizer-defined special/control tokens (BOS/EOS/PAD/UNK and any reserved special IDs).
+  \item \textbf{Drop whitespace-only and punctuation-only tokens:} for each token $t$, let $s = \texttt{decode}(t)$ and $u = \texttt{strip}(s)$. Punctuation: characters whose Unicode general category starts with \texttt{P} (i.e., P*); e.g.\ \texttt{unicodedata.category(ch).startswith("P")} in Python.
+  \begin{itemize}[leftmargin=2em]
+    \item remove $t$ if $u = \emptyset$;
+    \item remove $t$ if every character in $u$ is punctuation.
+  \end{itemize}
+  \item \textbf{Drop digit-only tokens} (optional): for each token $t$, let $s = \texttt{decode}(t)$ and $u = \texttt{strip}(s)$.
+  \begin{itemize}[leftmargin=2em]
+    \item remove $t$ if $u \neq \emptyset$ and every character in $u$ is a digit in $\{0,\dots,9\}$.
+  \end{itemize}
+\end{itemize}
+The EOS token is always excluded from $V'$ (hence $\text{EOS} \notin V_{\text{steer}}$), even if \texttt{drop\_special\_tokens} is false, so that only the dedicated $\delta_{\text{EOS}}$ applies and biases are not duplicated.
+Selection is then performed \emph{only} over $V'$:
+\[
+V_{\text{steer}} = \operatorname{Top\text{-}k}_{v\in V'}\;\Delta(v),
+\]
+where $k$ is a configurable hyperparameter.
+Because filtering is applied prior to ranking, the output contains exactly $k$
+tokens when $|V'| \ge k$; if $|V'| < k$, then $V_{\text{steer}} = V'$ and
+the output contains $|V'|$ tokens.
+These are the ``fluff'' tokens that appear disproportionately in verbose
+output; we will learn steering deltas for them in Phase~1.
+
+\subsection{Outputs}
+\begin{itemize}[leftmargin=2em]
+  \item A fixed set of $k$ steering tokens $V_{\text{steer}}\subset V$.
+  \item The frequency-difference scores $\Delta(v)$ for each $v\in V_{\text{steer}}$
+        (useful for analysis).
+  \item The set of \textbf{correct} compressed answers
+        $\{\hat a^{\text{comp}}_{c,q,i} : (\hat a^{\text{verbose}}_{c,q,i},\,\hat a^{\text{comp}}_{c,q,i})\in\mathcal{P}(c,q)\}$
+        across all training examples,
+        each paired with its sample weight $w_{c,q}=1/m_{c,q}$;
+        these serve as the \emph{only} training targets in Phase~1.
+\end{itemize}
+
+
+\section{Phase 1: Learn Steering Magnitudes $\delta_v$ for the Selected Tokens}
+\subsection{Learned module: Global Trainable Deltas}
+The learned parameters are $k+1$ raw scalars shared across all examples:
+\[
+z \in \mathbb{R}^{k+1}.
+\]
+The final deltas $\boldsymbol{\delta}=(\delta_{v_1},\dots,\delta_{v_k},\;\delta_{\text{EOS}})$
+are obtained from $z$ via a sign-constrained mapping described below.
+
+\paragraph{Sign-constrained delta parameterization.}
+All steering-token deltas are constrained to be \textbf{non-positive}
+(suppression only), while $\delta_{\text{EOS}}$ may take either sign.
+The constraints hold by construction through the parameterization of $z$.
+
+\paragraph{Mapping raw outputs to deltas.}
+For steering tokens $v_1,\dots,v_k$ (must satisfy $\delta_{v_i}\le 0$):
+\[
+\delta_{v_i} = -\delta_{\max}\,\sigma(z_i)
+\;\in\; [-\delta_{\max},\,0],
+\qquad i=1,\dots,k,
+\]
+where $\sigma(\cdot)$ is the logistic sigmoid.
+
+For EOS (free sign, either direction):
+\[
+\delta_{\text{EOS}} = \delta_{\max}\tanh(z_{k+1})
+\;\in\; [-\delta_{\max},\,\delta_{\max}].
+\]
+
+\subsection{Construct the logit bias from $\boldsymbol{\delta}$ and $V_{\text{steer}}$}
+Given a decoding step with next-token logits $\ell_t \in \mathbb{R}^{|V|}$ from the target model, apply an additive bias $b\in\mathbb{R}^{|V|}$:
+\[
+\ell'_t = \ell_t + b.
+\]
+
+\paragraph{Bias rule (per-token lookup).}
+\label{sec:bias-rule}
+Each selected token $v_i\in V_{\text{steer}}$ receives its own learned bias;
+all other tokens are unaffected:
+\[
+b[v] =
+\begin{cases}
+\delta_{v_i} & \text{if } v = v_i \in V_{\text{steer}},\\
+0            & \text{if } v\notin V_{\text{steer}}.
+\end{cases}
+\]
+
+\paragraph{EOS steering.}
+\label{sec:eos-steering}
+In addition, the EOS token always receives a dedicated additive bias:
+\[
+b[\text{EOS}] \;\mathrel{+}=\; \delta_{\text{EOS}}.
+\]
+This is applied at every decoding step, independently of $V_{\text{steer}}$.
+
+\paragraph{Operational procedure during generation.}
+The bias vector $b$ is built once from $\boldsymbol{\delta}$
+and the fixed set $V_{\text{steer}}$ --- it is a simple lookup table indexed by token id.
+No trie or automaton is needed.
+
+\subsection{Training objective}
+
+\paragraph{Phase~1 dataset.}
+Phase~1 training and evaluation always serialize $(c,q)$ using
+\texttt{target.prompt\_template} (same template for train and eval).
+For $(c,q)\in S$, denote by $\hat a^{\text{comp}}_{c,q,i}$ the $i$-th retained compressed answer in $\mathcal{P}(c,q)$, and $w_{c,q} := 1/m_{c,q}$.
+The training set is
+\[
+\mathcal{D}_1
+\;=\;
+\bigl\{\,(c,\,q,\,\hat a^{\text{comp}}_{c,q,i},\,w_{c,q})
+  \;:\;
+  (c,q)\in S,\;
+  i\in\{1,\dots,m_{c,q}\}
+\bigr\}.
+\]
+Each sample is $x := (c,\,q,\,\hat a^{\text{comp}}_{c,q,i},\,w_{c,q})$; define $w(x):=w_{c,q}$.
+The token sequence for $x$ is $(y_1,\dots,y_T) = \mathrm{Tok}(\hat a^{\text{comp}}_{c,q,i})$.
+We \textbf{never} train on the gold answer $a^*$ directly---$a^*$ was
+used only to judge correctness.
+We train the deltas by making the (biased) frozen target LLM predict this
+correct compressed answer via teacher forcing.
+Let the target LLM define next-token probabilities
+\[
+P_{\text{LLM}}(v \mid \pi) \quad\text{for token } v\in V \text{ given prefix } \pi.
+\]
+
+From the global parameters $\boldsymbol{\delta}\in\mathbb{R}^{k+1}$,
+a single bias vector $b\in\mathbb{R}^{|V|}$
+is \textbf{deterministically} computed via a per-token lookup into $V_{\text{steer}}$
+(see Sections~\ref{sec:bias-rule} and~\ref{sec:eos-steering}).
+The same $b$ is applied at every decoding step.
+Let $\pi_t := (c,q,y_{1:t-1})$ denote the prefix at step $t$.
+
+Define the \textbf{biased} next-token distribution by adding the bias in logit space:
+\[
+P^{(b)}_{\text{LLM}}(v\mid \pi_t)
+\;=\;
+\frac{P_{\text{LLM}}(v\mid \pi_t)\,\exp\!\big(b[v]\big)}
+{\sum_{u\in V} P_{\text{LLM}}(u\mid \pi_t)\,\exp\!\big(b[u]\big)}.
+\]
+
+Then the teacher-forced losses are:
+
+\paragraph{Task (SFT / NLL on $\hat a^{\text{comp}}$).}
+\[
+\mathcal{L}_{\text{NLL}}(\boldsymbol{\delta};\, x)
+\;=\;
+-\sum_{t=1}^{T}\log P^{(b)}_{\text{LLM}}\!\big(y_t \mid \pi_t\big).
+\]
+
+\paragraph{Conciseness surrogate (stop right after $\hat a^{\text{comp}}$).}
+\[
+\mathcal{L}_{\text{EOS}}(\boldsymbol{\delta};\, x)
+\;=\;
+-\log P^{(b)}_{\text{LLM}}\!\big(\text{EOS} \mid \pi_{T+1}\big),
+\qquad
+\pi_{T+1}:=(c,q,y_{1:T}).
+\]
+
+\paragraph{Regularization (keep biases small).}
+\[
+\mathcal{L}_{\text{reg}}(\boldsymbol{\delta};\, x)
+\;=\;
+\|\boldsymbol{\delta}\|_2^2.
+\]
+
+\paragraph{Per-sample loss.}
+\[
+\ell(\boldsymbol{\delta};\, x)
+\;=\;
+\lambda_{\text{task}}\,\mathcal{L}_{\text{NLL}}(\boldsymbol{\delta};\, x)
+\;+\;\lambda_{\text{stop}}\,\mathcal{L}_{\text{EOS}}(\boldsymbol{\delta};\, x)
+\;+\;\lambda_{\delta}\,\mathcal{L}_{\text{reg}}(\boldsymbol{\delta};\, x).
+\]
+
+\paragraph{Full weighted loss (no RL).}
+\[
+\boxed{
+\mathcal{L}(\boldsymbol{\delta}) \;:=\; \sum_{x\in\mathcal{D}_1} w(x)\;\ell(\boldsymbol{\delta};\, x)
+}
+\]
+Because $\sum_{i=1}^{m_{c,q}} w_{c,q} = 1$ for each $(c,q)$, every
+original example contributes equally to the objective.
+
+{\color{purple}%
+\paragraph{Optional ranking term (still no RL).}
+For sample $x=(c,q,\hat a^{\text{comp}}_{c,q,i},w_{c,q})$, the term compares the compressed answer to its corresponding verbose sample from the same retained pair: $\hat a^{\text{comp}}_{c,q,i}$ vs.\ $\hat a^{\text{verbose}}_{c,q,i}$.
+\[
+\mathcal{L}_{\text{rank}}(\boldsymbol{\delta};\, x)
+\;=\;
+\max\Big(0,\; m - \big[\log P^{(b)}_{\text{LLM}}(\hat a^{\text{comp}}_{c,q,i}\mid c,q)
+  - \log P^{(b)}_{\text{LLM}}(\hat a^{\text{verbose}}_{c,q,i}\mid c,q)\big]\Big),
+\]
+and add $+\lambda_{\text{rank}}\,\mathcal{L}_{\text{rank}}$ to the per-sample
+loss $\ell$.  The same weight $w(x)=w_{c,q}$ applies.
+}
+
+%% ────────────────────────────────────────────────────────────────
+\section{Configuration (kconfig)}
+\label{sec:kconfig}
+
+Every parameter used anywhere in Phase~0, Phase~1, or inference
+\textbf{must} appear explicitly in the YAML kconfig file.
+There are \textbf{no defaults and no fallbacks}: if a key is missing
+or has a \texttt{null}/empty value, the program must raise an error
+and terminate immediately.
+
+\subsection{General}
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{seed} --- global random seed (int).
+  \item \texttt{device} --- compute device, e.g.\ \texttt{"cuda:0"}, \texttt{"cpu"} (str).
+  \item \texttt{output\_dir} --- root directory for all artifacts: clusters, checkpoints, logs (str).
+  \item \texttt{log\_level} --- logging verbosity, e.g.\ \texttt{"INFO"}, \texttt{"DEBUG"} (str).
+\end{itemize}
+
+\subsection{Target Model}
+The Target model weights and tokenizer are both loaded from \texttt{target\_model\_id}.
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{target\_model\_id} --- single Hugging Face model id string; used to load the frozen Target LLM weights and \texttt{AutoTokenizer.from\_pretrained} (str).
+  \item \texttt{target.prompt\_template} --- template to serialize $(c,q)$ into the target model prompt; used for Phase~1 training and evaluation (str).
+  \item \texttt{target\_model.dtype} --- weight dtype, e.g.\ \texttt{"float16"}, \texttt{"bfloat16"}, \texttt{"float32"} (str).
+  \item \texttt{target\_model.max\_new\_tokens} --- maximum tokens to generate during inference/evaluation (int).
+  \item \texttt{target\_model.temperature} --- sampling temperature for generation (float).
+  \item \texttt{target\_model.top\_p} --- nucleus sampling $p$ (float).
+\end{itemize}
+
+\subsection{Data}
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{data.train\_path} --- path to the training set of $(c,q,a^*)$ examples (str).
+  \item \texttt{data.val\_path} --- path to the validation set (str).
+  \item \texttt{data.test\_path} --- path to the test set (str).
+  \item \texttt{data.format} --- file format, e.g.\ \texttt{"jsonl"}, \texttt{"csv"}, \texttt{"parquet"} (str).
+  \item \texttt{data.context\_key} --- field name for the context $c$ (str).
+  \item \texttt{data.query\_key} --- field name for the query $q$ (str).
+  \item \texttt{data.answer\_key} --- field name for the concise answer $a^*$ (str).
+\end{itemize}
+
+\subsection{Phase 0: Token Selection}
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{phase0.reflector.model\_name\_or\_path} --- model used as the reflector LLM; used only to compress Target-generated verbose answers (str).
+  \item \texttt{phase0.reflector.tokenizer} --- tokenizer for the reflector model (str).
+  \item[] \textbf{Note:} The Reflector tokenizer must match \texttt{phase0.reflector.model\_name\_or\_path} (load it via \texttt{AutoTokenizer.from\_pretrained(phase0.reflector.model\_name\_or\_path)}); do not set a different tokenizer.
+  \item \texttt{phase0.reflector.dtype} --- weight dtype for the reflector model (str).
+  \item \texttt{phase0.reflector.compress\_prompt\_template} --- prompt template for compression; takes query + previous Target-generated verbose answer, no context; include the exact instruction text given in Step~2 (str).
+  \item \texttt{phase0.reflector.max\_new\_tokens} --- max tokens per reflector compression call (int).
+  \item \texttt{phase0.reflector.temperature} --- sampling temperature for the reflector (float).
+  \item \texttt{phase0.reflector.top\_p} --- nucleus sampling $p$ for the reflector (float).
+  \item \texttt{phase0.verbose\_num\_samples} --- number of verbose answers $M_{\text{verbose}}$ to sample from the Target model per example (int).
+  \item \texttt{phase0.correctness.metric} --- metric used to judge compressed answers against $a^*$, e.g.\ \texttt{"exact\_match"}, \texttt{"f1"} (str).
+  \item \texttt{phase0.correctness.threshold} --- minimum metric score $\tau$ for a compressed answer to be considered correct (float).
+  \item \texttt{phase0.k} --- number of top tokens to select from the frequency difference $\Delta(v)$ (int).
+  \item \texttt{phase0.filters.drop\_special\_tokens} --- whether to drop special tokens before ranking (bool).
+  \item \texttt{phase0.filters.drop\_whitespace\_only} --- whether to drop whitespace/punctuation-only tokens (bool). Note: this flag drops both whitespace-only tokens ($u = \emptyset$) and punctuation-only tokens (all chars in $u$ are punctuation).
+  \item \texttt{phase0.filters.drop\_digit\_only} --- whether to drop digit-only tokens (bool).
+  \item \texttt{phase0.output\_path} --- path to save the selected token set $V_{\text{steer}}$ (str).
+\end{itemize}
+
+\subsection{Phase 1: Delta Learning (Global Parameters)}
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{phase1.steer\_tokens\_path} --- path to the Phase~0 selected-token artifact to load (str).
+  \item \texttt{phase1.delta\_max} --- maximum magnitude $\delta_{\max}$ used in the sign-constrained parameterization (float).
+  \item \texttt{phase1.k} --- number of steering tokens; must match Phase~0 (int).
+  \item \texttt{phase1.init.z\_steer} --- initial value for $z_1,\dots,z_k$ (steering-token raw parameters); all $k$ entries share this scalar (float).
+  \item \texttt{phase1.init.z\_eos} --- initial value for $z_{k+1}$ (EOS raw parameter), separate from steering (float).
+\end{itemize}
+
+\subsection{Training}
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{training.optimizer} --- optimizer name, e.g.\ \texttt{"adam"}, \texttt{"adamw"} (str).
+  \item \texttt{training.learning\_rate} --- learning rate (float).
+  \item \texttt{training.weight\_decay} --- optimizer weight decay (float).
+  \item \texttt{training.num\_epochs} --- number of training epochs (int).
+  \item \texttt{training.batch\_size} --- training batch size (int).
+  \item \texttt{training.grad\_clip\_norm} --- maximum gradient norm for clipping (float).
+  \item \texttt{training.eval\_every\_n\_steps} --- run validation every $n$ steps (int).
+  \item \texttt{training.checkpoint\_dir} --- directory to save model checkpoints (str).
+  \item \texttt{training.save\_every\_n\_steps} --- save a checkpoint every $n$ steps (int).
+\end{itemize}
+
+\subsection{Loss Weights}
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{loss.lambda\_task} --- weight $\lambda_{\text{task}}$ for $\mathcal{L}_{\text{NLL}}$ (float).
+  \item \texttt{loss.lambda\_stop} --- weight $\lambda_{\text{stop}}$ for $\mathcal{L}_{\text{EOS}}$ (float).
+  \item \texttt{loss.lambda\_delta} --- weight $\lambda_{\delta}$ for $\mathcal{L}_{\text{reg}}$ (float).
+  \item \texttt{loss.regularization\_target} --- what to regularize: \texttt{"deltas"} ($\|\boldsymbol{\delta}\|_2^2$) (str).
+  \item \texttt{loss.use\_ranking\_loss} --- whether to include $\mathcal{L}_{\text{rank}}$ (bool).
+  \item \texttt{loss.lambda\_rank} --- weight $\lambda_{\text{rank}}$ for $\mathcal{L}_{\text{rank}}$ (float).
+  \item \texttt{loss.ranking\_margin} --- margin $m$ in the ranking loss (float).
+\end{itemize}
+
+\subsection{Evaluation}
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{eval.metrics} --- list of metrics to compute, e.g.\ \texttt{["exact\_match","f1","mean\_length"]} (list[str]).
+  \item \texttt{eval.max\_new\_tokens} --- maximum tokens during evaluation generation (int).
+  \item \texttt{eval.temperature} --- sampling temperature during evaluation (float).
+  \item \texttt{eval.top\_p} --- nucleus sampling $p$ during evaluation (float).
+  \item \texttt{eval.num\_samples} --- number of samples per example for stochastic evaluation; set 1 for greedy (int).
+\end{itemize}
+
+\end{document}
